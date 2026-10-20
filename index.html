@@ -265,6 +265,7 @@ body:not(.playing) .eq i{animation-play-state:paused}
 .meter{height:4px;border-radius:2px;background:var(--surface-3);overflow:hidden;margin:6px 8px 8px}
 .meter i{display:block;height:100%;background:var(--accent)}
 .note{font-size:13px;color:var(--muted);padding:6px 8px 4px;line-height:1.6}
+.logbox{width:100%;height:160px;resize:vertical;border-radius:8px;border:1px solid var(--surface-3);background:#0D1016;color:var(--muted);font:11.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;padding:8px 10px;white-space:pre;overflow:auto}
 
 /* toast + drop */
 .toast{position:fixed;left:50%;bottom:calc(var(--tabbar-h) + 84px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);z-index:60;background:#fff;color:#000;padding:10px 16px;border-radius:8px;font-size:14px;font-weight:600;max-width:calc(100% - 32px);text-align:center;box-shadow:0 8px 24px var(--shadow);font-variant-numeric:tabular-nums}
@@ -383,7 +384,8 @@ body:not(.playing) .eq i{animation-play-state:paused}
 
 <div class="toast" id="toast" role="status" hidden></div>
 <div class="drop" id="drop" hidden>ここにドロップして追加</div>
-<audio id="audio" preload="auto" playsinline></audio>
+<audio id="audioA" preload="auto" playsinline></audio>
+<audio id="audioB" preload="auto" playsinline></audio>
 
 <script>
 'use strict';
@@ -451,8 +453,131 @@ const S = {
 };
 const RATES = [1, 1.25, 1.5, 2, 0.75];
 const LS_KEY = 'memoplayer:v1';
-const audio = $('#audio');
+/* ---------- dual-buffer audio (gapless background continuation) ---------- */
+const audioA = $('#audioA'), audioB = $('#audioB');
+let audio = audioA, other = audioB;   // `audio` = 再生側, `other` = 待機側/旧再生側 (呼び出し側はこれまで通り `audio.xxx` を参照する)
+let otherRole = 'empty';              // 'empty' | 'standby' | 'retiring'
+let otherId = null;                   // otherRole==='standby' のとき、待機側に積んである曲ID
+let standbyPlan = null;               // 待機側が昇格したときに適用する {id, order, pos}
+let pendingPlan = null;               // 再生側に反映待ちの {id, order, pos}（'playing' で確定）
+let crossfadeTriggered = false;
+let userPaused = true;                // true=ユーザーが明示的に止めた（または何も再生していない）
+let expectedPause = false;            // 内部処理で意図的に pause() する直前に立てるフラグ
+let recoveryFailCount = 0;
+let waitingTimer = null;
+const MAX_RECOVERY_TRIES = 3;
+let primedAudio = false;
+let actx = null, keepAliveGain = null;
 let pendingSeek = 0, dragging = false, dragP = 0;
+
+const LOG_KEY = 'memoplayer:playlog:v1';
+function elLabel(el){ return el === audioA ? 'A' : el === audioB ? 'B' : null; }
+function log(kind, el, extra){
+  try {
+    const id = el ? el.dataset.trackId : (extra && extra.trackId) || S.currentId;
+    const t = id ? trackById(id) : null;
+    const arr = JSON.parse(localStorage.getItem(LOG_KEY) || '[]');
+    arr.push({
+      ts: Date.now(), kind,
+      track: t ? t.name : (id || null),
+      el: elLabel(el),
+      time: el ? +((el.currentTime || 0).toFixed(2)) : null,
+      ...(extra || {})
+    });
+    while(arr.length > 200) arr.shift();
+    localStorage.setItem(LOG_KEY, JSON.stringify(arr));
+  } catch(e){}
+}
+
+// audio を意図的に pause() する直前に必ずこれを通す。実際に再生中だった（＝'pause' イベントが
+// 本当に発火する）ときだけ expectedPause を立てるので、フラグが消費されずに残って後の
+// 本物の異常停止を見逃す、という事故を防げる。
+function markExpectedPause(el){
+  if(el === audio && !el.paused) expectedPause = true;
+  try { el.pause(); } catch(e){}
+}
+function unlockAudio(){
+  if(primedAudio) return; primedAudio = true;
+  [audioA, audioB].forEach(el => {
+    try {
+      el.muted = true;
+      const p = el.play();
+      if(p && p.then) p.then(() => { el.pause(); el.muted = false; }).catch(() => { el.muted = false; });
+      else { el.pause(); el.muted = false; }
+    } catch(e){ el.muted = false; }
+  });
+  ensureKeepAlive();
+}
+function ensureKeepAlive(){
+  if(actx) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if(!AC) return;
+  try {
+    actx = new AC();
+    keepAliveGain = actx.createGain();
+    keepAliveGain.gain.value = 0.0001;
+    keepAliveGain.connect(actx.destination);
+    const osc = actx.createOscillator();
+    osc.frequency.value = 20;
+    osc.connect(keepAliveGain);
+    osc.start();
+  } catch(e){ actx = null; }
+}
+function resetAudioElements(){
+  [audioA, audioB].forEach(el => {
+    markExpectedPause(el);
+    try { el.removeAttribute('src'); el.load(); } catch(e){}
+    delete el.dataset.trackId;
+  });
+  audio = audioA; other = audioB;
+  otherRole = 'empty'; otherId = null; standbyPlan = null; pendingPlan = null;
+  crossfadeTriggered = false; recoveryFailCount = 0;
+  clearTimeout(waitingTimer);
+}
+
+/* ---------- queue prediction (shared by standby preload & manual nav) ---------- */
+function nextOrderState(){
+  if(!S.order.length || S.pos < 0) return null;
+  let order = S.order, pos = S.pos + 1;
+  if(pos >= order.length){
+    if(S.repeat !== 'all') return null;
+    if(S.shuffle){
+      if(S._wrapPreview && S._wrapPreview.base === S.currentId && S._wrapPreview.queueLen === S.queue.length){
+        order = S._wrapPreview.order;
+      } else {
+        order = shuffled(S.queue);
+        if(order.length > 1 && order[0] === S.currentId) order.push(order.shift());
+        S._wrapPreview = {base: S.currentId, queueLen: S.queue.length, order};
+      }
+    } else order = S.queue.slice();
+    pos = 0;
+  }
+  if(!order.length) return null;
+  return {id: order[pos], order, pos};
+}
+function clearStandby(){
+  if(otherRole === 'standby'){
+    markExpectedPause(other);
+    try { other.removeAttribute('src'); other.load(); } catch(e){}
+    delete other.dataset.trackId;
+    otherRole = 'empty'; otherId = null; standbyPlan = null;
+  }
+}
+function ensureStandby(){
+  if(otherRole === 'retiring') return;
+  const n = (S.repeat === 'one') ? null : nextOrderState();
+  if(!n){ clearStandby(); return; }
+  if(otherRole === 'standby' && otherId === n.id){ standbyPlan = {id: n.id, order: n.order, pos: n.pos}; return; }
+  const url = S.urls.get(n.id); if(!url) return;
+  markExpectedPause(other);
+  other.src = url;
+  other.dataset.trackId = n.id;
+  other.loop = false;
+  other.defaultPlaybackRate = S.rate; other.playbackRate = S.rate;
+  try { other.load(); } catch(e){}
+  otherRole = 'standby'; otherId = n.id;
+  standbyPlan = {id: n.id, order: n.order, pos: n.pos};
+}
 
 const trackById = id => S.tracks.find(t => t.id === id);
 const folderById = id => S.folders.find(f => f.id === id);
@@ -574,6 +699,7 @@ async function runPeaks(){
   if(peaksBusy || !db) return; peaksBusy = true;
   try {
     for(;;){
+      if(document.hidden) break;
       let t = S.peaksFirst && trackById(S.peaksFirst); S.peaksFirst = null;
       if(!t || t.peaks !== undefined) t = S.tracks.find(x => x.peaks === undefined);
       if(!t) break;
@@ -612,51 +738,89 @@ function setQueue(ids, startId){
   if(S.shuffle){ S.order = [startId, ...shuffled(ids.filter(x => x !== startId))]; S.pos = 0; }
   else { S.order = ids.slice(); S.pos = S.order.indexOf(startId); }
   S.queueLabel = viewLabel(); S.queueView = S.view;
+  S._wrapPreview = null;
 }
-function playFromView(id){ setQueue(visibleTracks().map(t => t.id), id); loadTrack(id, {autoplay:true}); }
+function playFromView(id){ unlockAudio(); setQueue(visibleTracks().map(t => t.id), id); loadTrack(id, {autoplay:true}); }
 function playAll(shuffle){
+  unlockAudio();
   const ids = visibleTracks().map(t => t.id); if(!ids.length) return;
   S.shuffle = !!shuffle;
   const start = S.shuffle ? ids[Math.floor(Math.random()*ids.length)] : ids[0];
   setQueue(ids, start); loadTrack(start, {autoplay:true});
 }
+// 現在の曲IDは再生側要素の dataset.trackId から決まる。ここでは src/再生の指示だけを行い、
+// S.currentId/S.pos やロック画面・画面表示の更新は再生側の 'playing' イベント確定後に行う
+// （autoplay:false のときは再生自体が起きないので、その場で確定させる）。
 function loadTrack(id, {autoplay = true, at = 0} = {}){
   const url = S.urls.get(id), t = trackById(id);
   if(!url || !t) return false;
-  S.currentId = id;
+  const idx = S.order.indexOf(id);
+  const plan = {id, order: S.order, pos: idx >= 0 ? idx : Math.max(0, S.pos)};
   pendingSeek = at > 0 ? at : 0;
+  markExpectedPause(audio);
   audio.src = url;
+  audio.dataset.trackId = id;
   audio.loop = S.repeat === 'one';
   audio.defaultPlaybackRate = S.rate; audio.playbackRate = S.rate;
-  if(autoplay){ const p = audio.play(); if(p) p.catch(err => { if(err.name !== 'AbortError') console.warn(err); }); }
+  crossfadeTriggered = false;
+  clearTimeout(waitingTimer);
   if(t.peaks === undefined){ S.peaksFirst = id; runPeaks(); }
-  updateMediaSession(t);
-  setProgress(at && t.duration ? at / t.duration : 0);
-  drawWave(); renderList(); renderPlayer(); renderQueue(); saveState();
+  if(autoplay){
+    userPaused = false; recoveryFailCount = 0;
+    pendingPlan = plan;
+    const p = audio.play(); if(p) p.catch(err => { if(err.name !== 'AbortError') console.warn(err); });
+    log('play', audio, {via:'loadTrack'});
+  } else {
+    pendingPlan = null;
+    S.order = plan.order; S.pos = plan.pos; S.currentId = id;
+    updateMediaSession(t); updatePosition();
+    setProgress(at && t.duration ? at / t.duration : 0);
+    drawWave(); renderList(); renderPlayer(); renderQueue(); renderLibrary();
+    ensureStandby();
+  }
   return true;
 }
 function step(dir, auto = false){
   if(!S.order.length) return;
   const wasPlaying = auto || !audio.paused;
-  let p = S.pos + dir;
-  if(p >= S.order.length){
-    if(S.repeat === 'all'){
-      if(S.shuffle){ S.order = shuffled(S.queue); if(S.order.length > 1 && S.order[0] === S.currentId) S.order.push(S.order.shift()); }
-      p = 0;
-    } else {
-      if(auto){ audio.pause(); try{ audio.currentTime = 0; }catch(e){} setProgress(0); renderPlayer(); }
-      else toast('キューの最後です');
+  if(!auto) unlockAudio();
+  if(dir > 0){
+    const n = nextOrderState();
+    if(!n){
+      if(auto){
+        userPaused = true;
+        markExpectedPause(audio);
+        try{ audio.currentTime = 0; }catch(e){} setProgress(0); renderPlayer();
+        log('queue-end', audio);
+      } else toast('キューの最後です');
       return;
     }
+    if(n.order !== S.order) S.order = n.order;
+    S._wrapPreview = null;
+    if(!loadTrack(n.id, {autoplay: wasPlaying})){ S.order.splice(n.pos, 1); if(S.order.length) step(dir, auto); }
+    return;
   }
+  let p = S.pos - 1;
   if(p < 0) p = S.repeat === 'all' ? S.order.length - 1 : 0;
-  S.pos = p;
-  if(!loadTrack(S.order[p], {autoplay: wasPlaying})){ S.order.splice(p, 1); if(dir < 0) S.pos = Math.max(0, p); else S.pos = p - 1; if(S.order.length) step(dir, auto); }
+  if(!loadTrack(S.order[p], {autoplay: wasPlaying})){
+    S.order.splice(p, 1);
+    if(p < S.pos) S.pos -= 1;
+  }
 }
-function prev(){ if(audio.currentTime > 3){ audio.currentTime = 0; updatePosition(); } else step(-1); }
+function prev(){ unlockAudio(); if(audio.currentTime > 3){ audio.currentTime = 0; updatePosition(); } else step(-1); }
 function togglePlay(){
+  const wasPaused = audio.paused;
+  unlockAudio();
   if(!S.currentId){ const v = visibleTracks(); if(v.length) playAll(S.shuffle); return; }
-  if(audio.paused){ const p = audio.play(); if(p) p.catch(()=>{}); } else audio.pause();
+  if(wasPaused){
+    userPaused = false; recoveryFailCount = 0;
+    const p = audio.play(); if(p) p.catch(()=>{});
+    log('play', audio, {via:'button'});
+  } else {
+    userPaused = true;
+    markExpectedPause(audio);
+    log('pause', audio, {via:'button'});
+  }
 }
 function toggleShuffle(){
   S.shuffle = !S.shuffle;
@@ -664,18 +828,24 @@ function toggleShuffle(){
     if(S.shuffle){ S.order = [S.currentId, ...shuffled(S.queue.filter(x => x !== S.currentId))]; S.pos = 0; }
     else { S.order = S.queue.slice(); S.pos = S.order.indexOf(S.currentId); }
   }
+  S._wrapPreview = null;
   toast(S.shuffle ? 'シャッフル オン' : 'シャッフル オフ', 1200);
   renderPlayer(); renderQueue(); renderListHead(); saveState();
+  ensureStandby();
 }
 function cycleRepeat(){
   S.repeat = {off:'all', all:'one', one:'off'}[S.repeat] || 'off';
   audio.loop = S.repeat === 'one';
+  other.loop = false;
+  S._wrapPreview = null;
   toast({off:'リピート オフ', all:'全曲リピート', one:'1曲リピート'}[S.repeat], 1200);
   renderPlayer(); renderListHead(); saveState();
+  ensureStandby();
 }
 function cycleRate(){
   S.rate = RATES[(RATES.indexOf(S.rate) + 1) % RATES.length];
   audio.defaultPlaybackRate = S.rate; audio.playbackRate = S.rate;
+  if(otherRole === 'standby'){ other.defaultPlaybackRate = S.rate; other.playbackRate = S.rate; }
   renderPlayer(); updatePosition(); saveState();
 }
 function skip(sec){
@@ -683,31 +853,6 @@ function skip(sec){
   const d = isFinite(audio.duration) ? audio.duration : Infinity;
   audio.currentTime = Math.max(0, Math.min(d - .1, audio.currentTime + sec));
   updatePosition();
-}
-
-audio.addEventListener('loadedmetadata', () => {
-  if(pendingSeek){ try { audio.currentTime = Math.min(pendingSeek, audio.duration - .5); } catch(e){} pendingSeek = 0; }
-  audio.playbackRate = S.rate;
-  const t = trackById(S.currentId);
-  if(t && isFinite(audio.duration) && Math.abs((t.duration||0) - audio.duration) > .5){ t.duration = audio.duration; saveTrack(t).catch(()=>{}); updateRowDuration(t); }
-  updatePosition(); renderTimes();
-});
-audio.addEventListener('play', onPlayState);
-audio.addEventListener('pause', onPlayState);
-audio.addEventListener('ended', () => step(1, true));
-let lastSave = 0;
-audio.addEventListener('timeupdate', () => {
-  if(!dragging && isFinite(audio.duration) && audio.duration > 0) setProgress(audio.currentTime / audio.duration);
-  renderTimes();
-  const now = Date.now(); if(now - lastSave > 4000){ lastSave = now; saveState(); }
-});
-audio.addEventListener('ratechange', updatePosition);
-audio.addEventListener('seeked', updatePosition);
-audio.addEventListener('error', () => { if(S.currentId) toast('この音声を再生できませんでした'); });
-function onPlayState(){
-  document.body.classList.toggle('playing', !audio.paused);
-  if(navigator.mediaSession) navigator.mediaSession.playbackState = audio.paused ? 'paused' : 'playing';
-  updatePosition(); renderPlayButtons(); renderListHead(); saveState();
 }
 
 /* ---------- lock screen / control center ---------- */
@@ -726,10 +871,157 @@ function updatePosition(){
       navigator.mediaSession.setPositionState({duration: audio.duration, playbackRate: audio.playbackRate || 1, position: Math.min(audio.currentTime, audio.duration)});
   } catch(e){}
 }
+
+/* ---------- element event handling: only the playing-side element's events update state/UI ---------- */
+let lastSave = 0;
+function onLoadedMetadata(el){
+  if(el !== audio) return;
+  if(pendingSeek){ try { el.currentTime = Math.min(pendingSeek, el.duration - .5); } catch(e){} pendingSeek = 0; }
+  el.playbackRate = S.rate;
+  const t = trackById(el.dataset.trackId);
+  if(t && isFinite(el.duration) && Math.abs((t.duration||0) - el.duration) > .5){ t.duration = el.duration; saveTrack(t).catch(()=>{}); updateRowDuration(t); }
+  updatePosition(); renderTimes();
+}
+function onElPlaying(el){
+  if(el !== audio) return;
+  clearTimeout(waitingTimer);
+  const id = el.dataset.trackId || null;
+  if(pendingPlan && pendingPlan.id === id){
+    if(pendingPlan.order !== S.order) S.order = pendingPlan.order;
+    S.pos = pendingPlan.pos; S.currentId = id;
+    pendingPlan = null;
+  } else if(id && id !== S.currentId){
+    S.currentId = id;
+    const idx = S.order.indexOf(id);
+    if(idx >= 0) S.pos = idx;
+  }
+  recoveryFailCount = 0;
+  const t = trackById(S.currentId);
+  if(t) updateMediaSession(t);
+  updatePosition();
+  if(isFinite(el.duration) && el.duration > 0) setProgress(el.currentTime / el.duration);
+  drawWave(); renderList(); renderPlayer(); renderQueue(); renderLibrary();
+  saveState();
+  ensureStandby();
+  log('playing', el);
+}
+function onPlayPauseChange(el){
+  if(el !== audio) return;
+  const isPlaying = !audio.paused;
+  document.body.classList.toggle('playing', isPlaying);
+  if(navigator.mediaSession) navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+  if(actx){ try { if(isPlaying) actx.resume(); else actx.suspend(); } catch(e){} }
+  updatePosition(); renderPlayButtons(); renderListHead(); saveState();
+}
+function onActivePause(el){
+  if(expectedPause){ expectedPause = false; return; }
+  if(userPaused) return;
+  if(el.ended) return;
+  attemptRecovery('pause');
+}
+function onEnded(el){
+  if(el === audio){
+    log('ended', el);
+    if(S.repeat === 'one') return;
+    step(1, true);
+  } else if(otherRole === 'retiring' && el === other){
+    log('ended(retiring)', el);
+    try { other.currentTime = 0; } catch(e){}
+    otherRole = 'empty'; otherId = null;
+    ensureStandby();
+  }
+}
+function armWaitingTimer(){
+  clearTimeout(waitingTimer);
+  waitingTimer = setTimeout(() => attemptRecovery('waiting-timeout'), 5000);
+}
+function attemptRecovery(reason){
+  if(userPaused) return;
+  const id = audio.dataset.trackId || S.currentId; if(!id) return;
+  const t = trackById(id); if(!t) return;
+  const url = S.urls.get(id); if(!url) return;
+  if(recoveryFailCount >= MAX_RECOVERY_TRIES){
+    log('recovery-giveup', audio, {reason});
+    userPaused = true;
+    markExpectedPause(audio);
+    renderPlayButtons(); renderListHead();
+    return;
+  }
+  recoveryFailCount++;
+  const resumeAt = isFinite(audio.currentTime) ? audio.currentTime : 0;
+  log('recover', audio, {reason, attempt: recoveryFailCount, at: resumeAt});
+  clearTimeout(waitingTimer);
+  markExpectedPause(audio);
+  audio.src = url;
+  audio.dataset.trackId = id;
+  audio.loop = S.repeat === 'one';
+  audio.defaultPlaybackRate = S.rate; audio.playbackRate = S.rate;
+  pendingSeek = resumeAt;
+  if(!pendingPlan || pendingPlan.id !== id){
+    const idx = S.order.indexOf(id);
+    pendingPlan = {id, order: S.order, pos: idx >= 0 ? idx : S.pos};
+  }
+  const p = audio.play(); if(p) p.catch(()=>{});
+}
+function maybeCrossfade(){
+  if(S.repeat === 'one') return;
+  if(otherRole !== 'standby' || !standbyPlan) return;
+  if(crossfadeTriggered) return;
+  const d = audio.duration; if(!isFinite(d) || d <= 0) return;
+  const threshold = 0.4 * (audio.playbackRate || 1);
+  if(d - audio.currentTime > threshold) return;
+  if(other.readyState < 2) return;
+  crossfadeTriggered = true;
+  doCrossfade();
+}
+function doCrossfade(){
+  const plan = standbyPlan; if(!plan) return;
+  other.loop = false;
+  other.defaultPlaybackRate = S.rate; other.playbackRate = S.rate;
+  const p = other.play(); if(p) p.catch(()=>{});
+  log('swap', other, {to: plan.id});
+  const old = audio;
+  audio = other; other = old;
+  otherRole = 'retiring'; otherId = null;
+  pendingPlan = plan; standbyPlan = null;
+  crossfadeTriggered = false;
+  clearTimeout(waitingTimer);
+}
+function onTimeUpdate(el){
+  if(el !== audio) return;
+  if(!document.hidden){
+    if(!dragging && isFinite(audio.duration) && audio.duration > 0) setProgress(audio.currentTime / audio.duration);
+    renderTimes();
+  }
+  const now = Date.now(); if(now - lastSave > 4000){ lastSave = now; saveState(); }
+  maybeCrossfade();
+}
+[audioA, audioB].forEach(el => {
+  el.addEventListener('loadedmetadata', () => onLoadedMetadata(el));
+  el.addEventListener('play', () => { log('play', el); if(el === audio) onPlayPauseChange(el); });
+  el.addEventListener('pause', () => { log('pause', el); if(el === audio){ onPlayPauseChange(el); onActivePause(el); } });
+  el.addEventListener('playing', () => onElPlaying(el));
+  el.addEventListener('ended', () => onEnded(el));
+  el.addEventListener('timeupdate', () => onTimeUpdate(el));
+  el.addEventListener('ratechange', () => { if(el === audio) updatePosition(); });
+  el.addEventListener('seeked', () => { if(el === audio) updatePosition(); });
+  el.addEventListener('stalled', () => { log('stalled', el); if(el === audio) attemptRecovery('stalled'); });
+  el.addEventListener('waiting', () => { log('waiting', el); if(el === audio) armWaitingTimer(); });
+  el.addEventListener('canplay', () => { if(el === audio) clearTimeout(waitingTimer); });
+  el.addEventListener('error', () => { log('error', el); if(el === audio){ if(S.currentId) toast('この音声を再生できませんでした'); attemptRecovery('error'); } });
+});
 if('mediaSession' in navigator){
   const h = (a, f) => { try { navigator.mediaSession.setActionHandler(a, f); } catch(e){} };
-  h('play', () => audio.play());
-  h('pause', () => audio.pause());
+  h('play', () => {
+    userPaused = false; recoveryFailCount = 0;
+    if(audio.src){ const p = audio.play(); if(p) p.catch(()=>{}); }
+    log('play', audio, {via:'mediaSession'});
+  });
+  h('pause', () => {
+    userPaused = true;
+    markExpectedPause(audio);
+    log('pause', audio, {via:'mediaSession'});
+  });
   h('previoustrack', prev);
   h('nexttrack', () => step(1));
   h('seekto', d => { if(d.fastSeek && 'fastSeek' in audio) audio.fastSeek(d.seekTime); else audio.currentTime = d.seekTime; updatePosition(); });
@@ -844,12 +1136,32 @@ async function renderSettings(){
         ? 'ホーム画面のアイコンを削除すると、取り込んだ曲も一緒に消えます。元のボイスメモは消えません。'
         : 'Safariのままだと、しばらく使わないと保存データが消されることがあります。共有 →「ホーム画面に追加」してから、そちらで取り込んでください。'}</p>
     </div>
-    <button class="dangerbtn" data-act="wipe">すべての曲とフォルダを削除</button>`;
+    <button class="dangerbtn" data-act="wipe">すべての曲とフォルダを削除</button>
+    <div class="card">
+      <h3>再生ログ</h3>
+      <textarea class="logbox" id="playLog" readonly>${esc(formatPlayLog())}</textarea>
+      <div class="btnrow">
+        <button class="btn" data-act="logcopy">コピー</button>
+        <button class="btn" data-act="logclear">消去</button>
+      </div>
+    </div>`;
+}
+function formatPlayLog(){
+  let arr = [];
+  try { arr = JSON.parse(localStorage.getItem(LOG_KEY) || '[]'); } catch(e){}
+  if(!arr.length) return 'ログはまだありません';
+  return arr.slice().reverse().map(e => {
+    const d = new Date(e.ts);
+    const time = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3,'0')}`;
+    const extra = Object.keys(e).filter(k => !['ts','kind','el','track','time'].includes(k)).map(k => `${k}=${e[k]}`).join(' ');
+    return [time, e.kind, e.el ? `[${e.el}]` : '', e.track || '', e.time != null ? `@${e.time}s` : '', extra].filter(Boolean).join(' ');
+  }).join('\n');
 }
 async function wipeAll(){
   if(!S.tracks.length && !S.folders.length){ toast('削除するデータはありません'); return; }
   if(!await confirmBox('すべて削除', `${S.tracks.length}曲と${S.folders.length}個のフォルダを削除します。元に戻せません。`, 'すべて削除')) return;
-  audio.pause(); audio.removeAttribute('src'); audio.load();
+  userPaused = true;
+  resetAudioElements();
   await tx(['tracks','blobs','folders'], 'readwrite', x => { ['tracks','blobs','folders'].forEach(n => x.objectStore(n).clear()); });
   S.urls.forEach(u => URL.revokeObjectURL(u)); S.urls.clear();
   Object.assign(S, {tracks:[], folders:[], queue:[], order:[], pos:-1, currentId:null, view:'all', libOpen:false, lastImport:null, addTarget:null});
@@ -861,6 +1173,7 @@ function renderStats(){
   $('#stats').textContent = S.tracks.length ? `${S.tracks.length}曲 · ${fmtSize(total)}` : '';
 }
 function renderListHead(){
+  if(document.hidden) return;
   const list = visibleTracks();
   const el = $('#listhead');
   const dur = list.reduce((a,t) => a + (t.duration||0), 0);
@@ -883,6 +1196,7 @@ function renderListHead(){
     </div>`;
 }
 function renderList(){
+  if(document.hidden) return;
   const list = visibleTracks();
   const empty = $('#empty');
   if(!list.length){
@@ -920,6 +1234,7 @@ function renderSelBar(){
   renderMini();
 }
 function renderMini(){
+  if(document.hidden) return;
   const t = trackById(S.currentId);
   $('#mini').hidden = !t || S.selecting;
   if(!t) return;
@@ -928,6 +1243,7 @@ function renderMini(){
   $('#miniIn').style.setProperty('--h', hueOf(t.id));
 }
 function renderPlayButtons(){
+  if(document.hidden) return;
   const playing = !audio.paused;
   $('#miniPlay').innerHTML = ic(playing ? 'pause' : 'play');
   $('#miniPlay').setAttribute('aria-label', playing ? '一時停止' : '再生');
@@ -935,6 +1251,7 @@ function renderPlayButtons(){
   $('#pPlay').setAttribute('aria-label', playing ? '一時停止' : '再生');
 }
 function renderPlayer(){
+  if(document.hidden) return;
   renderMini(); renderPlayButtons();
   const t = trackById(S.currentId);
   $('#pShuffle').classList.toggle('on', S.shuffle);
@@ -951,23 +1268,27 @@ function renderPlayer(){
   renderTimes();
 }
 function renderTimes(){
+  if(document.hidden) return;
   const d = audio.duration, c = dragging ? dragP * (d || 0) : audio.currentTime;
   $('#tCur').textContent = fmtTime(c || 0);
   $('#tRem').textContent = isFinite(d) ? '-' + fmtTime(Math.max(0, d - (c || 0))) : '--:--';
 }
 function setProgress(p){
+  if(document.hidden) return;
   p = Math.max(0, Math.min(1, p || 0));
   $('#wave').style.setProperty('--p', p);
   $('#miniProg').style.setProperty('--p', p);
   $('#wave').setAttribute('aria-valuenow', Math.round(p * 100));
 }
 function drawWave(){
+  if(document.hidden) return;
   const t = trackById(S.currentId);
   const hs = (t && Array.isArray(t.peaks)) ? t.peaks : Array(64).fill(.16);
   const html = hs.map(v => `<i style="height:${(v*100).toFixed(1)}%"></i>`).join('');
   $('#waveBase').innerHTML = html; $('#waveFill').innerHTML = html;
 }
 function renderQueue(){
+  if(document.hidden) return;
   const ol = $('#queue');
   if(!S.order.length){ ol.innerHTML = ''; $('#qInfo').textContent = ''; return; }
   $('#qInfo').textContent = `${S.pos + 1} / ${S.order.length}${S.shuffle ? ' · シャッフル' : ''}`;
@@ -1067,7 +1388,8 @@ async function deleteTracks(ids){
   S.queue = S.queue.filter(id => !set.has(id));
   S.order = S.order.filter(id => !set.has(id));
   if(set.has(S.currentId)){
-    audio.pause(); audio.removeAttribute('src'); audio.load();
+    userPaused = true;
+    resetAudioElements();
     S.currentId = null; S.pos = -1; setProgress(0); closePlayer();
     if(navigator.mediaSession) navigator.mediaSession.metadata = null;
   } else S.pos = S.order.indexOf(S.currentId);
@@ -1075,6 +1397,7 @@ async function deleteTracks(ids){
   S.selected.clear();
   toast(`${ids.length}曲を削除しました`);
   render(); renderQueue(); saveState();
+  ensureStandby();
 }
 async function renameTrack(id){
   const t = trackById(id); if(!t) return;
@@ -1084,12 +1407,14 @@ async function renameTrack(id){
   render(); renderQueue();
 }
 function playNext(id){
-  if(!S.currentId){ setQueue([id], id); loadTrack(id); return; }
+  if(!S.currentId){ unlockAudio(); setQueue([id], id); loadTrack(id); return; }
   S.order = S.order.filter(x => x !== id);
   S.pos = S.order.indexOf(S.currentId);
   S.order.splice(S.pos + 1, 0, id);
   if(!S.queue.includes(id)) S.queue.push(id);
+  S._wrapPreview = null;
   toast('次に再生します'); renderQueue(); saveState();
+  ensureStandby();
 }
 function trackMenu(id){
   const t = trackById(id); if(!t) return;
@@ -1155,7 +1480,22 @@ $('#addPage').addEventListener('change', async e => {
   else S.addTarget = e.target.value || null;
   saveState(); renderAdd();
 });
-$('#settingsPage').addEventListener('click', e => { if(e.target.closest('[data-act="wipe"]')) wipeAll(); });
+$('#settingsPage').addEventListener('click', async e => {
+  if(e.target.closest('[data-act="wipe"]')) wipeAll();
+  if(e.target.closest('[data-act="logcopy"]')){
+    const text = formatPlayLog();
+    try {
+      if(navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(text);
+      else { const ta = $('#playLog'); ta.select(); document.execCommand('copy'); }
+      toast('ログをコピーしました');
+    } catch(e){ toast('コピーできませんでした'); }
+  }
+  if(e.target.closest('[data-act="logclear"]')){
+    localStorage.removeItem(LOG_KEY);
+    renderSettings();
+    toast('ログを消去しました');
+  }
+});
 $('#btnSelect').addEventListener('click', () => { S.selecting = !S.selecting; S.selected.clear(); renderList(); renderSelBar(); });
 $('#q').addEventListener('input', e => { S.q = e.target.value.trim(); renderListHead(); renderList(); });
 
@@ -1249,7 +1589,7 @@ $('#pFwd').addEventListener('click', () => skip(15));
 $('#queue').addEventListener('click', e => {
   const li = e.target.closest('[data-i]'); if(!li) return;
   const i = +li.dataset.i; if(i === S.pos){ togglePlay(); return; }
-  S.pos = i; loadTrack(S.order[i], {autoplay:true});
+  unlockAudio(); loadTrack(S.order[i], {autoplay:true});
 });
 document.addEventListener('keydown', e => {
   if(e.target.closest('input,textarea,select')) return;
@@ -1287,6 +1627,23 @@ $('#pPrev').innerHTML = ic('prev');
 $('#pNext').innerHTML = ic('next');
 $('#pBack').innerHTML = ic('back15');
 $('#pFwd').innerHTML = ic('fwd15');
+
+/* ---------- foreground / background handling ---------- */
+function catchUpUI(){
+  if(isFinite(audio.duration) && audio.duration > 0) setProgress(audio.currentTime / audio.duration);
+  drawWave(); render(); renderQueue();
+}
+document.addEventListener('visibilitychange', () => {
+  log('visibilitychange', audio, {hidden: document.hidden});
+  if(document.hidden) return;
+  if(actx && actx.state === 'suspended' && !userPaused && S.currentId) actx.resume().catch(()=>{});
+  if(S.currentId && !userPaused && audio.paused){
+    if(audio.ended) step(1, true);
+    else attemptRecovery('visibilitychange');
+  }
+  catchUpUI();
+  runPeaks();
+});
 
 /* ---------- boot ---------- */
 (async function init(){
