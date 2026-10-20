@@ -467,7 +467,6 @@ let recoveryFailCount = 0;
 let waitingTimer = null;
 const MAX_RECOVERY_TRIES = 3;
 let primedAudio = false;
-let actx = null, keepAliveGain = null;
 let pendingSeek = 0, dragging = false, dragP = 0;
 
 const LOG_KEY = 'memoplayer:playlog:v1';
@@ -510,27 +509,6 @@ function unlockAudio(){
     if(p && p.then) p.then(settle).catch(settle);
     else settle();
   } catch(e){ target.muted = false; }
-  ensureKeepAlive();
-}
-// バックグラウンドでオーディオセッションが切られやすいのは iOS の挙動なので、
-// 常時動くこの無音維持は iOS 以外では作らない（Android/デスクトップでは不要なCPU消費になる）。
-const isIOS = /iP(hone|od|ad)/.test(navigator.platform) ||
-  (navigator.userAgent.includes('Mac') && navigator.maxTouchPoints > 1);
-function ensureKeepAlive(){
-  if(actx || !isIOS) return;
-  const AC = window.AudioContext || window.webkitAudioContext;
-  if(!AC) return;
-  try {
-    actx = new AC();
-    keepAliveGain = actx.createGain();
-    keepAliveGain.gain.value = 0.0001;
-    keepAliveGain.connect(actx.destination);
-    // 波形を作らない分 OscillatorNode より僅かに軽い無音源
-    const src = actx.createConstantSource();
-    src.offset.value = 1;
-    src.connect(keepAliveGain);
-    src.start();
-  } catch(e){ actx = null; }
 }
 function resetAudioElements(){
   [audioA, audioB].forEach(el => {
@@ -919,7 +897,6 @@ function onPlayPauseChange(el){
   const isPlaying = !audio.paused;
   document.body.classList.toggle('playing', isPlaying);
   if(navigator.mediaSession) navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
-  if(actx){ try { if(isPlaying) actx.resume(); else actx.suspend(); } catch(e){} }
   updatePosition(); renderPlayButtons(); renderListHead(); saveState();
 }
 function onActivePause(el){
@@ -1645,7 +1622,6 @@ function catchUpUI(){
 document.addEventListener('visibilitychange', () => {
   log('visibilitychange', audio, {hidden: document.hidden});
   if(document.hidden) return;
-  if(actx && actx.state === 'suspended' && !userPaused && S.currentId) actx.resume().catch(()=>{});
   if(S.currentId && !userPaused && audio.paused){
     if(audio.ended) step(1, true);
     else attemptRecovery('visibilitychange');
