@@ -760,7 +760,9 @@ function loadTrack(id, {autoplay = true, at = 0} = {}){
   } else {
     pendingPlan = null;
     S.order = plan.order; S.pos = plan.pos; S.currentId = id;
-    updateMediaSession(t); updatePosition();
+    updateMediaSession(t);
+    if(navigator.mediaSession) navigator.mediaSession.playbackState = 'paused';
+    updatePosition();
     setProgress(at && t.duration ? at / t.duration : 0);
     drawWave(); renderList(); renderPlayer(); renderQueue(); renderLibrary();
     ensureStandby();
@@ -885,6 +887,8 @@ function onElPlaying(el){
   recoveryFailCount = 0;
   const t = trackById(S.currentId);
   if(t) updateMediaSession(t);
+  if(navigator.mediaSession) navigator.mediaSession.playbackState = 'playing';
+  document.body.classList.add('playing');
   updatePosition();
   if(isFinite(el.duration) && el.duration > 0) setProgress(el.currentTime / el.duration);
   drawWave(); renderList(); renderPlayer(); renderQueue(); renderLibrary();
@@ -979,7 +983,8 @@ function onTimeUpdate(el){
     if(!dragging && isFinite(audio.duration) && audio.duration > 0) setProgress(audio.currentTime / audio.duration);
     renderTimes();
   }
-  const now = Date.now(); if(now - lastSave > 4000){ lastSave = now; saveState(); }
+  const now = Date.now();
+  if(now - lastSave > 4000){ lastSave = now; saveState(); updatePosition(); }
   maybeCrossfade();
 }
 [audioA, audioB].forEach(el => {
