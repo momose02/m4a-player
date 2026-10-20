@@ -508,8 +508,12 @@ function unlockAudio(){
   });
   ensureKeepAlive();
 }
+// バックグラウンドでオーディオセッションが切られやすいのは iOS の挙動なので、
+// 常時動くこの無音維持は iOS 以外では作らない（Android/デスクトップでは不要なCPU消費になる）。
+const isIOS = /iP(hone|od|ad)/.test(navigator.platform) ||
+  (navigator.userAgent.includes('Mac') && navigator.maxTouchPoints > 1);
 function ensureKeepAlive(){
-  if(actx) return;
+  if(actx || !isIOS) return;
   const AC = window.AudioContext || window.webkitAudioContext;
   if(!AC) return;
   try {
@@ -517,10 +521,11 @@ function ensureKeepAlive(){
     keepAliveGain = actx.createGain();
     keepAliveGain.gain.value = 0.0001;
     keepAliveGain.connect(actx.destination);
-    const osc = actx.createOscillator();
-    osc.frequency.value = 20;
-    osc.connect(keepAliveGain);
-    osc.start();
+    // 波形を作らない分 OscillatorNode より僅かに軽い無音源
+    const src = actx.createConstantSource();
+    src.offset.value = 1;
+    src.connect(keepAliveGain);
+    src.start();
   } catch(e){ actx = null; }
 }
 function resetAudioElements(){
@@ -1024,6 +1029,9 @@ if('mediaSession' in navigator){
   });
   h('previoustrack', prev);
   h('nexttrack', () => step(1));
+  // ロック画面に出る「送り/戻し」操作は、秒数スキップではなく曲の変更として扱う
+  h('seekbackward', prev);
+  h('seekforward', () => step(1));
   h('seekto', d => { if(d.fastSeek && 'fastSeek' in audio) audio.fastSeek(d.seekTime); else audio.currentTime = d.seekTime; updatePosition(); });
 }
 
