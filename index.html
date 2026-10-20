@@ -384,8 +384,7 @@ body:not(.playing) .eq i{animation-play-state:paused}
 
 <div class="toast" id="toast" role="status" hidden></div>
 <div class="drop" id="drop" hidden>ここにドロップして追加</div>
-<audio id="audioA" preload="auto" playsinline></audio>
-<audio id="audioB" preload="auto" playsinline></audio>
+<audio id="audio" preload="auto" playsinline></audio>
 
 <script>
 'use strict';
@@ -453,34 +452,26 @@ const S = {
 };
 const RATES = [1, 1.25, 1.5, 2, 0.75];
 const LS_KEY = 'memoplayer:v1';
-/* ---------- dual-buffer audio (gapless background continuation) ---------- */
-const audioA = $('#audioA'), audioB = $('#audioB');
-let audio = audioA, other = audioB;   // `audio` = 再生側, `other` = 待機側/旧再生側 (呼び出し側はこれまで通り `audio.xxx` を参照する)
-let otherRole = 'empty';              // 'empty' | 'standby' | 'retiring'
-let otherId = null;                   // otherRole==='standby' のとき、待機側に積んである曲ID
-let standbyPlan = null;               // 待機側が昇格したときに適用する {id, order, pos}
-let pendingPlan = null;               // 再生側に反映待ちの {id, order, pos}（'playing' で確定）
-let crossfadeTriggered = false;
+/* ---------- audio element ---------- */
+const audio = $('#audio');
+let pendingPlan = null;               // 反映待ちの {id, order, pos}（'playing' で確定するまで S.currentId は変えない）
 let userPaused = true;                // true=ユーザーが明示的に止めた（または何も再生していない）
 let expectedPause = false;            // 内部処理で意図的に pause() する直前に立てるフラグ
 let recoveryFailCount = 0;
 let waitingTimer = null;
 const MAX_RECOVERY_TRIES = 3;
-let primedAudio = false;
 let pendingSeek = 0, dragging = false, dragP = 0;
 
 const LOG_KEY = 'memoplayer:playlog:v1';
-function elLabel(el){ return el === audioA ? 'A' : el === audioB ? 'B' : null; }
-function log(kind, el, extra){
+function log(kind, extra){
   try {
-    const id = el ? el.dataset.trackId : (extra && extra.trackId) || S.currentId;
+    const id = (extra && extra.trackId) || audio.dataset.trackId || S.currentId;
     const t = id ? trackById(id) : null;
     const arr = JSON.parse(localStorage.getItem(LOG_KEY) || '[]');
     arr.push({
       ts: Date.now(), kind,
       track: t ? t.name : (id || null),
-      el: elLabel(el),
-      time: el ? +((el.currentTime || 0).toFixed(2)) : null,
+      time: +((audio.currentTime || 0).toFixed(2)),
       ...(extra || {})
     });
     while(arr.length > 200) arr.shift();
@@ -491,79 +482,16 @@ function log(kind, el, extra){
 // audio を意図的に pause() する直前に必ずこれを通す。実際に再生中だった（＝'pause' イベントが
 // 本当に発火する）ときだけ expectedPause を立てるので、フラグが消費されずに残って後の
 // 本物の異常停止を見逃す、という事故を防げる。
-function markExpectedPause(el){
-  if(el === audio && !el.paused) expectedPause = true;
-  try { el.pause(); } catch(e){}
+function markExpectedPause(){
+  if(!audio.paused) expectedPause = true;
+  try { audio.pause(); } catch(e){}
 }
-// 再生側は直後に呼ばれる本物の play() で unlock されるので触らない。ここで両方に
-// muted play()→pause() をかけると、再生側では「本物の再生開始」と「このpause予約」が
-// 競合し、再生が一瞬止まって復帰処理が走り、曲や再生位置がずれる事故につながる。
-// 待機側（まだ本物の play() が来ない方）だけを慣らす。
-function unlockAudio(){
-  if(primedAudio) return; primedAudio = true;
-  const target = other;
-  try {
-    target.muted = true;
-    const p = target.play();
-    const settle = () => { if(target !== audio) target.pause(); target.muted = false; };
-    if(p && p.then) p.then(settle).catch(settle);
-    else settle();
-  } catch(e){ target.muted = false; }
-}
-function resetAudioElements(){
-  [audioA, audioB].forEach(el => {
-    markExpectedPause(el);
-    try { el.removeAttribute('src'); el.load(); } catch(e){}
-    delete el.dataset.trackId;
-  });
-  audio = audioA; other = audioB;
-  otherRole = 'empty'; otherId = null; standbyPlan = null; pendingPlan = null;
-  crossfadeTriggered = false; recoveryFailCount = 0;
+function resetAudio(){
+  markExpectedPause();
+  try { audio.removeAttribute('src'); audio.load(); } catch(e){}
+  delete audio.dataset.trackId;
+  pendingPlan = null; recoveryFailCount = 0;
   clearTimeout(waitingTimer);
-}
-
-/* ---------- queue prediction (shared by standby preload & manual nav) ---------- */
-function nextOrderState(){
-  if(!S.order.length || S.pos < 0) return null;
-  let order = S.order, pos = S.pos + 1;
-  if(pos >= order.length){
-    if(S.repeat !== 'all') return null;
-    if(S.shuffle){
-      if(S._wrapPreview && S._wrapPreview.base === S.currentId && S._wrapPreview.queueLen === S.queue.length){
-        order = S._wrapPreview.order;
-      } else {
-        order = shuffled(S.queue);
-        if(order.length > 1 && order[0] === S.currentId) order.push(order.shift());
-        S._wrapPreview = {base: S.currentId, queueLen: S.queue.length, order};
-      }
-    } else order = S.queue.slice();
-    pos = 0;
-  }
-  if(!order.length) return null;
-  return {id: order[pos], order, pos};
-}
-function clearStandby(){
-  if(otherRole === 'standby'){
-    markExpectedPause(other);
-    try { other.removeAttribute('src'); other.load(); } catch(e){}
-    delete other.dataset.trackId;
-    otherRole = 'empty'; otherId = null; standbyPlan = null;
-  }
-}
-function ensureStandby(){
-  if(otherRole === 'retiring') return;
-  const n = (S.repeat === 'one') ? null : nextOrderState();
-  if(!n){ clearStandby(); return; }
-  if(otherRole === 'standby' && otherId === n.id){ standbyPlan = {id: n.id, order: n.order, pos: n.pos}; return; }
-  const url = S.urls.get(n.id); if(!url) return;
-  markExpectedPause(other);
-  other.src = url;
-  other.dataset.trackId = n.id;
-  other.loop = false;
-  other.defaultPlaybackRate = S.rate; other.playbackRate = S.rate;
-  try { other.load(); } catch(e){}
-  otherRole = 'standby'; otherId = n.id;
-  standbyPlan = {id: n.id, order: n.order, pos: n.pos};
 }
 
 const trackById = id => S.tracks.find(t => t.id === id);
@@ -725,18 +653,16 @@ function setQueue(ids, startId){
   if(S.shuffle){ S.order = [startId, ...shuffled(ids.filter(x => x !== startId))]; S.pos = 0; }
   else { S.order = ids.slice(); S.pos = S.order.indexOf(startId); }
   S.queueLabel = viewLabel(); S.queueView = S.view;
-  S._wrapPreview = null;
 }
-function playFromView(id){ unlockAudio(); setQueue(visibleTracks().map(t => t.id), id); loadTrack(id, {autoplay:true}); }
+function playFromView(id){ setQueue(visibleTracks().map(t => t.id), id); loadTrack(id, {autoplay:true}); }
 function playAll(shuffle){
-  unlockAudio();
   const ids = visibleTracks().map(t => t.id); if(!ids.length) return;
   S.shuffle = !!shuffle;
   const start = S.shuffle ? ids[Math.floor(Math.random()*ids.length)] : ids[0];
   setQueue(ids, start); loadTrack(start, {autoplay:true});
 }
-// 現在の曲IDは再生側要素の dataset.trackId から決まる。ここでは src/再生の指示だけを行い、
-// S.currentId/S.pos やロック画面・画面表示の更新は再生側の 'playing' イベント確定後に行う
+// 現在の曲IDは audio 要素の dataset.trackId から決まる。ここでは src/再生の指示だけを行い、
+// S.currentId/S.pos やロック画面・画面表示の更新は 'playing' イベント確定後に行う
 // （autoplay:false のときは再生自体が起きないので、その場で確定させる）。
 function loadTrack(id, {autoplay = true, at = 0} = {}){
   const url = S.urls.get(id), t = trackById(id);
@@ -744,19 +670,18 @@ function loadTrack(id, {autoplay = true, at = 0} = {}){
   const idx = S.order.indexOf(id);
   const plan = {id, order: S.order, pos: idx >= 0 ? idx : Math.max(0, S.pos)};
   pendingSeek = at > 0 ? at : 0;
-  markExpectedPause(audio);
+  markExpectedPause();
   audio.src = url;
   audio.dataset.trackId = id;
   audio.loop = S.repeat === 'one';
   audio.defaultPlaybackRate = S.rate; audio.playbackRate = S.rate;
-  crossfadeTriggered = false;
   clearTimeout(waitingTimer);
   if(t.peaks === undefined){ S.peaksFirst = id; runPeaks(); }
   if(autoplay){
     userPaused = false; recoveryFailCount = 0;
     pendingPlan = plan;
     const p = audio.play(); if(p) p.catch(err => { if(err.name !== 'AbortError') console.warn(err); });
-    log('play', audio, {via:'loadTrack'});
+    log('play', {via:'loadTrack'});
   } else {
     pendingPlan = null;
     S.order = plan.order; S.pos = plan.pos; S.currentId = id;
@@ -765,50 +690,45 @@ function loadTrack(id, {autoplay = true, at = 0} = {}){
     updatePosition();
     setProgress(at && t.duration ? at / t.duration : 0);
     drawWave(); renderList(); renderPlayer(); renderQueue(); renderLibrary();
-    ensureStandby();
   }
   return true;
 }
 function step(dir, auto = false){
   if(!S.order.length) return;
   const wasPlaying = auto || !audio.paused;
-  if(!auto) unlockAudio();
-  if(dir > 0){
-    const n = nextOrderState();
-    if(!n){
+  let p = S.pos + dir;
+  if(p >= S.order.length){
+    if(S.repeat === 'all'){
+      if(S.shuffle){ S.order = shuffled(S.queue); if(S.order.length > 1 && S.order[0] === S.currentId) S.order.push(S.order.shift()); }
+      p = 0;
+    } else {
       if(auto){
         userPaused = true;
-        markExpectedPause(audio);
+        markExpectedPause();
         try{ audio.currentTime = 0; }catch(e){} setProgress(0); renderPlayer();
-        log('queue-end', audio);
+        log('queue-end');
       } else toast('キューの最後です');
       return;
     }
-    if(n.order !== S.order) S.order = n.order;
-    S._wrapPreview = null;
-    if(!loadTrack(n.id, {autoplay: wasPlaying})){ S.order.splice(n.pos, 1); if(S.order.length) step(dir, auto); }
-    return;
   }
-  let p = S.pos - 1;
   if(p < 0) p = S.repeat === 'all' ? S.order.length - 1 : 0;
   if(!loadTrack(S.order[p], {autoplay: wasPlaying})){
     S.order.splice(p, 1);
     if(p < S.pos) S.pos -= 1;
+    if(S.order.length) step(dir, auto);
   }
 }
-function prev(){ unlockAudio(); if(audio.currentTime > 3){ audio.currentTime = 0; updatePosition(); } else step(-1); }
+function prev(){ if(audio.currentTime > 3){ audio.currentTime = 0; updatePosition(); } else step(-1); }
 function togglePlay(){
-  const wasPaused = audio.paused;
-  unlockAudio();
   if(!S.currentId){ const v = visibleTracks(); if(v.length) playAll(S.shuffle); return; }
-  if(wasPaused){
+  if(audio.paused){
     userPaused = false; recoveryFailCount = 0;
     const p = audio.play(); if(p) p.catch(()=>{});
-    log('play', audio, {via:'button'});
+    log('play', {via:'button'});
   } else {
     userPaused = true;
-    markExpectedPause(audio);
-    log('pause', audio, {via:'button'});
+    markExpectedPause();
+    log('pause', {via:'button'});
   }
 }
 function toggleShuffle(){
@@ -817,24 +737,18 @@ function toggleShuffle(){
     if(S.shuffle){ S.order = [S.currentId, ...shuffled(S.queue.filter(x => x !== S.currentId))]; S.pos = 0; }
     else { S.order = S.queue.slice(); S.pos = S.order.indexOf(S.currentId); }
   }
-  S._wrapPreview = null;
   toast(S.shuffle ? 'シャッフル オン' : 'シャッフル オフ', 1200);
   renderPlayer(); renderQueue(); renderListHead(); saveState();
-  ensureStandby();
 }
 function cycleRepeat(){
   S.repeat = {off:'all', all:'one', one:'off'}[S.repeat] || 'off';
   audio.loop = S.repeat === 'one';
-  other.loop = false;
-  S._wrapPreview = null;
   toast({off:'リピート オフ', all:'全曲リピート', one:'1曲リピート'}[S.repeat], 1200);
   renderPlayer(); renderListHead(); saveState();
-  ensureStandby();
 }
 function cycleRate(){
   S.rate = RATES[(RATES.indexOf(S.rate) + 1) % RATES.length];
   audio.defaultPlaybackRate = S.rate; audio.playbackRate = S.rate;
-  if(otherRole === 'standby'){ other.defaultPlaybackRate = S.rate; other.playbackRate = S.rate; }
   renderPlayer(); updatePosition(); saveState();
 }
 function skip(sec){
@@ -861,20 +775,29 @@ function updatePosition(){
   } catch(e){}
 }
 
-/* ---------- element event handling: only the playing-side element's events update state/UI ---------- */
+/* ---------- element event handling ---------- */
 let lastSave = 0;
-function onLoadedMetadata(el){
-  if(el !== audio) return;
-  if(pendingSeek){ try { el.currentTime = Math.min(pendingSeek, el.duration - .5); } catch(e){} pendingSeek = 0; }
-  el.playbackRate = S.rate;
-  const t = trackById(el.dataset.trackId);
-  if(t && isFinite(el.duration) && Math.abs((t.duration||0) - el.duration) > .5){ t.duration = el.duration; saveTrack(t).catch(()=>{}); updateRowDuration(t); }
+audio.addEventListener('loadedmetadata', () => {
+  if(pendingSeek){ try { audio.currentTime = Math.min(pendingSeek, audio.duration - .5); } catch(e){} pendingSeek = 0; }
+  audio.playbackRate = S.rate;
+  const t = trackById(audio.dataset.trackId);
+  if(t && isFinite(audio.duration) && Math.abs((t.duration||0) - audio.duration) > .5){ t.duration = audio.duration; saveTrack(t).catch(()=>{}); updateRowDuration(t); }
   updatePosition(); renderTimes();
-}
-function onElPlaying(el){
-  if(el !== audio) return;
+});
+audio.addEventListener('play', () => { log('play'); onPlayPauseChange(); });
+audio.addEventListener('pause', () => { log('pause'); onPlayPauseChange(); onActivePause(); });
+audio.addEventListener('playing', onElPlaying);
+audio.addEventListener('ended', onEnded);
+audio.addEventListener('timeupdate', onTimeUpdate);
+audio.addEventListener('ratechange', updatePosition);
+audio.addEventListener('seeked', updatePosition);
+audio.addEventListener('stalled', () => { log('stalled'); attemptRecovery('stalled'); });
+audio.addEventListener('waiting', () => { log('waiting'); armWaitingTimer(); });
+audio.addEventListener('canplay', () => clearTimeout(waitingTimer));
+audio.addEventListener('error', () => { log('error'); if(S.currentId) toast('この音声を再生できませんでした'); attemptRecovery('error'); });
+function onElPlaying(){
   clearTimeout(waitingTimer);
-  const id = el.dataset.trackId || null;
+  const id = audio.dataset.trackId || null;
   if(pendingPlan && pendingPlan.id === id){
     if(pendingPlan.order !== S.order) S.order = pendingPlan.order;
     S.pos = pendingPlan.pos; S.currentId = id;
@@ -890,36 +813,27 @@ function onElPlaying(el){
   if(navigator.mediaSession) navigator.mediaSession.playbackState = 'playing';
   document.body.classList.add('playing');
   updatePosition();
-  if(isFinite(el.duration) && el.duration > 0) setProgress(el.currentTime / el.duration);
+  if(isFinite(audio.duration) && audio.duration > 0) setProgress(audio.currentTime / audio.duration);
   drawWave(); renderList(); renderPlayer(); renderQueue(); renderLibrary();
   saveState();
-  ensureStandby();
-  log('playing', el);
+  log('playing');
 }
-function onPlayPauseChange(el){
-  if(el !== audio) return;
+function onPlayPauseChange(){
   const isPlaying = !audio.paused;
   document.body.classList.toggle('playing', isPlaying);
   if(navigator.mediaSession) navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
   updatePosition(); renderPlayButtons(); renderListHead(); saveState();
 }
-function onActivePause(el){
+function onActivePause(){
   if(expectedPause){ expectedPause = false; return; }
   if(userPaused) return;
-  if(el.ended) return;
+  if(audio.ended) return;
   attemptRecovery('pause');
 }
-function onEnded(el){
-  if(el === audio){
-    log('ended', el);
-    if(S.repeat === 'one') return;
-    step(1, true);
-  } else if(otherRole === 'retiring' && el === other){
-    log('ended(retiring)', el);
-    try { other.currentTime = 0; } catch(e){}
-    otherRole = 'empty'; otherId = null;
-    ensureStandby();
-  }
+function onEnded(){
+  log('ended');
+  if(S.repeat === 'one') return;
+  step(1, true);
 }
 function armWaitingTimer(){
   clearTimeout(waitingTimer);
@@ -931,17 +845,17 @@ function attemptRecovery(reason){
   const t = trackById(id); if(!t) return;
   const url = S.urls.get(id); if(!url) return;
   if(recoveryFailCount >= MAX_RECOVERY_TRIES){
-    log('recovery-giveup', audio, {reason});
+    log('recovery-giveup', {reason});
     userPaused = true;
-    markExpectedPause(audio);
+    markExpectedPause();
     renderPlayButtons(); renderListHead();
     return;
   }
   recoveryFailCount++;
   const resumeAt = isFinite(audio.currentTime) ? audio.currentTime : 0;
-  log('recover', audio, {reason, attempt: recoveryFailCount, at: resumeAt});
+  log('recover', {reason, attempt: recoveryFailCount, at: resumeAt});
   clearTimeout(waitingTimer);
-  markExpectedPause(audio);
+  markExpectedPause();
   audio.src = url;
   audio.dataset.trackId = id;
   audio.loop = S.repeat === 'one';
@@ -953,65 +867,25 @@ function attemptRecovery(reason){
   }
   const p = audio.play(); if(p) p.catch(()=>{});
 }
-function maybeCrossfade(){
-  if(S.repeat === 'one') return;
-  if(otherRole !== 'standby' || !standbyPlan) return;
-  if(crossfadeTriggered) return;
-  const d = audio.duration; if(!isFinite(d) || d <= 0) return;
-  const threshold = 0.4 * (audio.playbackRate || 1);
-  if(d - audio.currentTime > threshold) return;
-  if(other.readyState < 2) return;
-  crossfadeTriggered = true;
-  doCrossfade();
-}
-function doCrossfade(){
-  const plan = standbyPlan; if(!plan) return;
-  other.loop = false;
-  other.defaultPlaybackRate = S.rate; other.playbackRate = S.rate;
-  const p = other.play(); if(p) p.catch(()=>{});
-  log('swap', other, {to: plan.id});
-  const old = audio;
-  audio = other; other = old;
-  otherRole = 'retiring'; otherId = null;
-  pendingPlan = plan; standbyPlan = null;
-  crossfadeTriggered = false;
-  clearTimeout(waitingTimer);
-}
-function onTimeUpdate(el){
-  if(el !== audio) return;
+function onTimeUpdate(){
   if(!document.hidden){
     if(!dragging && isFinite(audio.duration) && audio.duration > 0) setProgress(audio.currentTime / audio.duration);
     renderTimes();
   }
   const now = Date.now();
   if(now - lastSave > 4000){ lastSave = now; saveState(); updatePosition(); }
-  maybeCrossfade();
 }
-[audioA, audioB].forEach(el => {
-  el.addEventListener('loadedmetadata', () => onLoadedMetadata(el));
-  el.addEventListener('play', () => { log('play', el); if(el === audio) onPlayPauseChange(el); });
-  el.addEventListener('pause', () => { log('pause', el); if(el === audio){ onPlayPauseChange(el); onActivePause(el); } });
-  el.addEventListener('playing', () => onElPlaying(el));
-  el.addEventListener('ended', () => onEnded(el));
-  el.addEventListener('timeupdate', () => onTimeUpdate(el));
-  el.addEventListener('ratechange', () => { if(el === audio) updatePosition(); });
-  el.addEventListener('seeked', () => { if(el === audio) updatePosition(); });
-  el.addEventListener('stalled', () => { log('stalled', el); if(el === audio) attemptRecovery('stalled'); });
-  el.addEventListener('waiting', () => { log('waiting', el); if(el === audio) armWaitingTimer(); });
-  el.addEventListener('canplay', () => { if(el === audio) clearTimeout(waitingTimer); });
-  el.addEventListener('error', () => { log('error', el); if(el === audio){ if(S.currentId) toast('この音声を再生できませんでした'); attemptRecovery('error'); } });
-});
 if('mediaSession' in navigator){
   const h = (a, f) => { try { navigator.mediaSession.setActionHandler(a, f); } catch(e){} };
   h('play', () => {
     userPaused = false; recoveryFailCount = 0;
     if(audio.src){ const p = audio.play(); if(p) p.catch(()=>{}); }
-    log('play', audio, {via:'mediaSession'});
+    log('play', {via:'mediaSession'});
   });
   h('pause', () => {
     userPaused = true;
-    markExpectedPause(audio);
-    log('pause', audio, {via:'mediaSession'});
+    markExpectedPause();
+    log('pause', {via:'mediaSession'});
   });
   h('previoustrack', prev);
   h('nexttrack', () => step(1));
@@ -1144,15 +1018,15 @@ function formatPlayLog(){
   return arr.slice().reverse().map(e => {
     const d = new Date(e.ts);
     const time = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3,'0')}`;
-    const extra = Object.keys(e).filter(k => !['ts','kind','el','track','time'].includes(k)).map(k => `${k}=${e[k]}`).join(' ');
-    return [time, e.kind, e.el ? `[${e.el}]` : '', e.track || '', e.time != null ? `@${e.time}s` : '', extra].filter(Boolean).join(' ');
+    const extra = Object.keys(e).filter(k => !['ts','kind','track','time'].includes(k)).map(k => `${k}=${e[k]}`).join(' ');
+    return [time, e.kind, e.track || '', e.time != null ? `@${e.time}s` : '', extra].filter(Boolean).join(' ');
   }).join('\n');
 }
 async function wipeAll(){
   if(!S.tracks.length && !S.folders.length){ toast('削除するデータはありません'); return; }
   if(!await confirmBox('すべて削除', `${S.tracks.length}曲と${S.folders.length}個のフォルダを削除します。元に戻せません。`, 'すべて削除')) return;
   userPaused = true;
-  resetAudioElements();
+  resetAudio();
   await tx(['tracks','blobs','folders'], 'readwrite', x => { ['tracks','blobs','folders'].forEach(n => x.objectStore(n).clear()); });
   S.urls.forEach(u => URL.revokeObjectURL(u)); S.urls.clear();
   Object.assign(S, {tracks:[], folders:[], queue:[], order:[], pos:-1, currentId:null, view:'all', libOpen:false, lastImport:null, addTarget:null});
@@ -1380,7 +1254,7 @@ async function deleteTracks(ids){
   S.order = S.order.filter(id => !set.has(id));
   if(set.has(S.currentId)){
     userPaused = true;
-    resetAudioElements();
+    resetAudio();
     S.currentId = null; S.pos = -1; setProgress(0); closePlayer();
     if(navigator.mediaSession) navigator.mediaSession.metadata = null;
   } else S.pos = S.order.indexOf(S.currentId);
@@ -1388,7 +1262,6 @@ async function deleteTracks(ids){
   S.selected.clear();
   toast(`${ids.length}曲を削除しました`);
   render(); renderQueue(); saveState();
-  ensureStandby();
 }
 async function renameTrack(id){
   const t = trackById(id); if(!t) return;
@@ -1398,14 +1271,12 @@ async function renameTrack(id){
   render(); renderQueue();
 }
 function playNext(id){
-  if(!S.currentId){ unlockAudio(); setQueue([id], id); loadTrack(id); return; }
+  if(!S.currentId){ setQueue([id], id); loadTrack(id); return; }
   S.order = S.order.filter(x => x !== id);
   S.pos = S.order.indexOf(S.currentId);
   S.order.splice(S.pos + 1, 0, id);
   if(!S.queue.includes(id)) S.queue.push(id);
-  S._wrapPreview = null;
   toast('次に再生します'); renderQueue(); saveState();
-  ensureStandby();
 }
 function trackMenu(id){
   const t = trackById(id); if(!t) return;
@@ -1580,7 +1451,7 @@ $('#pFwd').addEventListener('click', () => skip(15));
 $('#queue').addEventListener('click', e => {
   const li = e.target.closest('[data-i]'); if(!li) return;
   const i = +li.dataset.i; if(i === S.pos){ togglePlay(); return; }
-  unlockAudio(); loadTrack(S.order[i], {autoplay:true});
+  loadTrack(S.order[i], {autoplay:true});
 });
 document.addEventListener('keydown', e => {
   if(e.target.closest('input,textarea,select')) return;
@@ -1625,7 +1496,7 @@ function catchUpUI(){
   drawWave(); render(); renderQueue();
 }
 document.addEventListener('visibilitychange', () => {
-  log('visibilitychange', audio, {hidden: document.hidden});
+  log('visibilitychange', {hidden: document.hidden});
   if(document.hidden) return;
   if(S.currentId && !userPaused && audio.paused){
     if(audio.ended) step(1, true);
