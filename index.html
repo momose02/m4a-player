@@ -496,16 +496,20 @@ function markExpectedPause(el){
   if(el === audio && !el.paused) expectedPause = true;
   try { el.pause(); } catch(e){}
 }
+// 再生側は直後に呼ばれる本物の play() で unlock されるので触らない。ここで両方に
+// muted play()→pause() をかけると、再生側では「本物の再生開始」と「このpause予約」が
+// 競合し、再生が一瞬止まって復帰処理が走り、曲や再生位置がずれる事故につながる。
+// 待機側（まだ本物の play() が来ない方）だけを慣らす。
 function unlockAudio(){
   if(primedAudio) return; primedAudio = true;
-  [audioA, audioB].forEach(el => {
-    try {
-      el.muted = true;
-      const p = el.play();
-      if(p && p.then) p.then(() => { el.pause(); el.muted = false; }).catch(() => { el.muted = false; });
-      else { el.pause(); el.muted = false; }
-    } catch(e){ el.muted = false; }
-  });
+  const target = other;
+  try {
+    target.muted = true;
+    const p = target.play();
+    const settle = () => { if(target !== audio) target.pause(); target.muted = false; };
+    if(p && p.then) p.then(settle).catch(settle);
+    else settle();
+  } catch(e){ target.muted = false; }
   ensureKeepAlive();
 }
 // バックグラウンドでオーディオセッションが切られやすいのは iOS の挙動なので、
@@ -1029,9 +1033,6 @@ if('mediaSession' in navigator){
   });
   h('previoustrack', prev);
   h('nexttrack', () => step(1));
-  // ロック画面に出る「送り/戻し」操作は、秒数スキップではなく曲の変更として扱う
-  h('seekbackward', prev);
-  h('seekforward', () => step(1));
   h('seekto', d => { if(d.fastSeek && 'fastSeek' in audio) audio.fastSeek(d.seekTime); else audio.currentTime = d.seekTime; updatePosition(); });
 }
 
